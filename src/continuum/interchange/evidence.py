@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -111,12 +112,13 @@ class EvidencePrimitive(BaseModel):
         if kind == "relation":
             return Relation.from_event(ev, **common)
         if kind == "checkpoint":
-            cid = ev.payload.get("checkpoint_id")
-            record = known.get(cid) if isinstance(cid, str) else None
+            raw_cid = ev.payload.get("checkpoint_id")
+            record = known.get(raw_cid) if isinstance(raw_cid, str) else None
+            cid, version, trigger = _checkpoint_meta(ev.payload, ev.event_id)
             return Checkpoint(
-                checkpoint_id=cid if isinstance(cid, str) else ev.event_id,
-                version=ev.payload.get("version", 0),
-                trigger=ev.payload.get("trigger", "unknown"),
+                checkpoint_id=cid,
+                version=version,
+                trigger=trigger,
                 integrity_hash=record.integrity_hash if record is not None else None,
                 **common,
             )
@@ -186,26 +188,12 @@ class Relation(EvidencePrimitive):
     def from_event(cls, ev: Event, **common: Any) -> Relation:
         """Build a relation primitive, guessing its endpoints from the payload.
 
-        A dependency edge's endpoints are spelled differently per event family
-        (``resource`` for a declaration, ``decision_id`` / ``finding_id`` for
-        those), so this is the one place primitive construction inspects the
-        payload instead of copying it. Keeping it next to the fields it fills
-        means a new event family that spells an endpoint differently lands in
-        the model rather than in an exporter dict nobody type-checks (#1155).
+        The guess lives in :func:`_relation_endpoints` so the readable fields
+        and the values :func:`verify_export` cross-checks them against stay
+        in one place (#1155).
         """
-        source_id = (
-            ev.payload.get("resource")
-            or ev.payload.get("decision_id")
-            or ev.payload.get("finding_id")
-        )
-        target_id = ev.payload.get("evidence") or ev.payload.get("depends_on")
-        if isinstance(target_id, list) and target_id:
-            target_id = target_id[0]
-        return cls(
-            source_id=str(source_id) if source_id else None,
-            target_id=str(target_id) if target_id else None,
-            **common,
-        )
+        source_id, target_id = _relation_endpoints(ev.payload)
+        return cls(source_id=source_id, target_id=target_id, **common)
 
 
 class Checkpoint(EvidencePrimitive):
@@ -279,6 +267,38 @@ def _classify(event: Event) -> Kind:
     return "transition"
 
 
+def _relation_endpoints(payload: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Guess a dependency edge's endpoints from the event payload.
+
+    The endpoints are spelled differently per event family (``resource`` for
+    a declaration, ``decision_id`` / ``finding_id`` for those), so this is the
+    one place primitive construction inspects the payload instead of copying
+    it. Sharing one helper between :meth:`Relation.from_event` and
+    :func:`verify_export` keeps the readable fields and the values they are
+    cross-checked against from drifting apart (#1155).
+    """
+    source = payload.get("resource") or payload.get("decision_id") or payload.get("finding_id")
+    target = payload.get("evidence") or payload.get("depends_on")
+    if isinstance(target, list) and target:
+        target = target[0]
+    return (str(source) if source else None, str(target) if target else None)
+
+
+def _checkpoint_meta(payload: Mapping[str, Any], event_id: Any) -> tuple[str, int, str]:
+    """Read a checkpoint primitive's (checkpoint_id, version, trigger) values.
+
+    The event payload names the checkpoint it logged and falls back to the
+    event's own id, and the version and trigger defaults match the record's
+    defaults. Sharing one helper between :meth:`EvidencePrimitive.for_event`
+    and :func:`verify_export` keeps construction and cross-checking in
+    agreement (#1155).
+    """
+    cid = payload.get("checkpoint_id")
+    if not isinstance(cid, str):
+        cid = event_id
+    return cid, payload.get("version", 0), payload.get("trigger", "unknown")
+
+
 def _common_fields(ev: Event, *, sequence: int, prev_hash: str | None) -> dict[str, Any]:
     """Fields every event-backed primitive shares.
 
@@ -338,8 +358,17 @@ def export_evidence(storage: Storage, run_id: str) -> list[EvidencePrimitive]:
             assert prim.sequence == i
             assert prim.prev_hash == prev
             assert prim.content_hash == stable_hash(prim.signature_inputs)
-            # also recompute event digest for transitions/observations/relations
             prev = prim.content_hash
+        assert len(exported) == expected_count
+        assert exported[-1].content_hash == expected_head
+
+    Or via :func:`verify_export`::
+
+        ok = verify_export(
+            exported,
+            expected_count=expected_count,
+            expected_head=expected_head,
+        )
 
     Pure read, no writes, zero new dependencies.
     """
@@ -385,7 +414,24 @@ def export_evidence(storage: Storage, run_id: str) -> list[EvidencePrimitive]:
     return primitives
 
 
-def verify_export(primitives: Sequence[EvidencePrimitive | Mapping[str, Any]]) -> bool:
+def _same_timestamp(t1: Any, t2: Any) -> bool:
+    """Compare two timestamps for semantic equality across ISO variations."""
+    if t1 == t2:
+        return True
+    if isinstance(t1, str) and isinstance(t2, str):
+        try:
+            return datetime.fromisoformat(t1) == datetime.fromisoformat(t2)
+        except Exception:
+            return False
+    return False
+
+
+def verify_export(
+    primitives: Sequence[EvidencePrimitive | Mapping[str, Any]],
+    *,
+    expected_count: int | None = None,
+    expected_head: str | None = None,
+) -> bool:
     """Verify an exported stream exactly as a receiver would.
 
     Accepts the models or the mappings a JSON-lines consumer produces after
@@ -393,35 +439,140 @@ def verify_export(primitives: Sequence[EvidencePrimitive | Mapping[str, Any]]) -
     export in memory run the same check.
 
     Returns True if the chain is intact, sequences are contiguous starting at
-    1, each content_hash matches the recomputed digest of signature_inputs
-    (for events) or is present for checkpoints, and prev_hash links are
-    correct. Used in tests to prove truncation is detectable.
+    1, prev_hash links are correct, each content_hash matches the recomputed
+    digest of signature_inputs, readable duplicated fields match their verified
+    counterparts in signature_inputs, and stream boundaries match expected_count
+    and expected_head if provided.
+
+    Known limitation: the event-backed checkpoint primitive's ``integrity_hash``
+    mirrors the checkpoint record the exporter looked up, and the event's
+    signature inputs do not anchor it, so it is only cross-checked on the
+    record-backed path (where it must equal ``content_hash``). A receiver that
+    also holds the checkpoint records should compare it against
+    ``StateCheckpoint.integrity_hash`` directly.
     """
+    if expected_count is not None and len(primitives) != expected_count:
+        return False
+    if expected_head is not None:
+        if not primitives:
+            return False
+        last = primitives[-1]
+        last_hash = (
+            last.content_hash
+            if isinstance(last, EvidencePrimitive)
+            else last.get("content_hash")
+            if isinstance(last, Mapping)
+            else None
+        )
+        if last_hash != expected_head:
+            return False
+
     prev: str | None = None
     for i, prim in enumerate(primitives, start=1):
-        p = prim.model_dump() if isinstance(prim, EvidencePrimitive) else dict(prim)
+        if isinstance(prim, EvidencePrimitive):
+            p = prim.model_dump()
+        elif isinstance(prim, Mapping):
+            p = dict(prim)
+        else:
+            return False
+
         if p.get("sequence") != i:
             return False
         if p.get("prev_hash") != prev:
             return False
-        # Recompute event hash where possible.
+
         sig = p.get("signature_inputs")
-        if sig is not None:
-            # For event-backed primitives, signature_inputs is the event content.
-            # Recompute and compare to content_hash.
-            try:
-                recomputed = stable_hash(sig)
-            except Exception:
+        if not isinstance(sig, Mapping):
+            return False
+
+        try:
+            recomputed = stable_hash(sig)
+        except Exception:
+            return False
+        if p.get("content_hash") != recomputed:
+            return False
+
+        # Cross-check readable fields against verified signature_inputs.
+        if "event_id" in sig:
+            # Event-backed primitive
+            if p.get("run_id") != sig.get("run_id"):
                 return False
-            if p.get("content_hash") != recomputed:
-                # For checkpoint primitives that were not event-backed, the
-                # content_hash is the checkpoint's integrity_hash, not the
-                # stable_hash of signature_inputs. In that case, we accept
-                # the stored hash as long as prev links hold; the checkpoint's
-                # own verify() would be used. We only enforce the event case
-                # where event_id is present and type is not checkpoint-only.
-                # To keep it simple, we require the hash to match the stored
-                # event hash which we already have; if it doesn't, it's tampered.
+            if p.get("event_id") != sig.get("event_id"):
                 return False
+            if p.get("event_type") != sig.get("type"):
+                return False
+            if p.get("origin") != sig.get("source"):
+                return False
+            if not _same_timestamp(p.get("timestamp"), sig.get("timestamp")):
+                return False
+            if p.get("payload") != sig.get("payload"):
+                return False
+
+            ev_type = sig.get("type")
+            if ev_type in _CHECKPOINT_TYPES:
+                expected_kind = "checkpoint"
+            elif ev_type in _OBSERVATION_TYPES:
+                expected_kind = "observation"
+            elif ev_type in _RELATION_TYPES:
+                expected_kind = "relation"
+            else:
+                expected_kind = "transition"
+
+            if p.get("kind") != expected_kind:
+                return False
+
+            if expected_kind == "observation":
+                if not _same_timestamp(p.get("observed_at"), sig.get("timestamp")):
+                    return False
+            elif expected_kind == "relation":
+                ev_payload = sig.get("payload")
+                if not isinstance(ev_payload, Mapping):
+                    return False
+                expected_source, expected_target = _relation_endpoints(ev_payload)
+                if p.get("source_id") != expected_source or p.get("target_id") != expected_target:
+                    return False
+            elif expected_kind == "checkpoint":
+                ev_payload = sig.get("payload")
+                if not isinstance(ev_payload, Mapping):
+                    return False
+                expected_cid, expected_version, expected_trigger = _checkpoint_meta(
+                    ev_payload, sig.get("event_id")
+                )
+                if p.get("checkpoint_id") != expected_cid:
+                    return False
+                if p.get("version") != expected_version:
+                    return False
+                if p.get("trigger") != expected_trigger:
+                    return False
+        else:
+            # Standalone checkpoint record primitive (built via for_checkpoint)
+            if p.get("kind") != "checkpoint":
+                return False
+            if p.get("run_id") != sig.get("run_id"):
+                return False
+            if p.get("checkpoint_id") != sig.get("checkpoint_id"):
+                return False
+            if p.get("version") != sig.get("version"):
+                return False
+            if p.get("trigger") != sig.get("trigger"):
+                return False
+            if not _same_timestamp(p.get("timestamp"), sig.get("created_at")):
+                return False
+            if p.get("event_id") != sig.get("checkpoint_id"):
+                return False
+            if p.get("event_type") != _CHECKPOINT_EVENT_TYPE:
+                return False
+            if p.get("origin") != Origin.DETERMINISTIC.value:
+                return False
+            expected_payload = {
+                "checkpoint_id": sig.get("checkpoint_id"),
+                "version": sig.get("version"),
+                "trigger": sig.get("trigger"),
+            }
+            if p.get("payload") != expected_payload:
+                return False
+            if p.get("integrity_hash") != p.get("content_hash"):
+                return False
+
         prev = p.get("content_hash")
     return True
