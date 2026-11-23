@@ -10,6 +10,12 @@ Test counts: ~4400 collected on a minimal env.
 
 ### Added
 
+- **Unit coverage for authority reconciliation (#1994).**
+  `tests/test_reconcilers.py` now drives the `probe_authority_verdict` timeout,
+  launch failure, non-zero exit, and unreadable output arms, and `settle_authority`
+  across missing probes, unsettled verdicts, dry runs, and the
+  `AUTHORITY_RECONCILED` event a definitive verdict appends. Tests only, no runtime
+  change.
 - **Unit coverage for models bounded-collection validators, risk-detail clamp, and caused_by known-id checks (#1980).**
   `tests/test_models.py` covers bounded-list validators (`ConsumedInputs`, `DecisionPayload`,
   `ActionRecordPayload`), `validate_caused_by` known-id checks, `_risk_detail` folding and
